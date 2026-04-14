@@ -3,282 +3,218 @@ import re
 import shutil
 import unicodedata
 import pandas as pd
+import numpy as np
 import glob
+import gc
+from tqdm import tqdm
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import make_pipeline
-from sklearn.metrics import classification_report
 
-# Config
-pasta_origem_dir = os.path.join(os.path.expanduser("~"), "Downloads") #caminho do seu arquivo
+# Ativa o progresso do pandas
+tqdm.pandas()
 
-NEGATIVOS = ["péssimo", "horrível", "ruim", "odioso", "não recomendo", "decepcionante", "finjo", "jamais", "detesto", "pior", "deus me defenda"]
-POSITIVOS = ["excelente", "ótimo", "fantástico", "maravilhoso", "adorei", "muito bom", "super recomendo", "parabéns"]
+# IMPORTANTE: Biblioteca externa de temas
+try:
+    from temas import temas as TEMAS_DICT
+except ImportError:
+    print("❌ Erro: Arquivo 'temas.py' não encontrado.")
+    TEMAS_DICT = {}
 
+# ----------------- Configurações -----------------
+pasta_origem_dir = r"C:"
 
-def safe_text(txt):
-    if txt is None or pd.isna(txt):
+NEGATIVOS = ["pessimo", "horrivel", "ruim", "odioso", "nao recomendo", "decepcionante", "finjo", "jamais", "detesto", "pior"]
+POSITIVOS = ["excelente", "otimo", "fantastico", "maravilhoso", "adorei", "muito bom", "super recomendo", "parabens", "recomendo"]
+
+# ----------------- Funções Otimizadas -----------------
+
+def limpar_texto(txt):
+    # 1. Checa se é nulo primeiro (sem usar 'if not')
+    if pd.isna(txt):
         return ""
-    return str(txt).strip()
+    
+    # 2. Converte para string e remove espaços
+    txt_str = str(txt).strip()
+    
+    # 3. Se a string estiver vazia, retorna vazio
+    if txt_str == "":
+        return ""
+    
+    # Agora segue o baile com a limpeza
+    txt_lower = txt_str.lower()
+    
+    # Normalização e remoção de acentos
+    nfkd = unicodedata.normalize("NFKD", txt_lower)
+    txt_sem_acento = "".join([c for c in nfkd if not unicodedata.combining(c)])
+    
+    # Limpeza de caracteres especiais
+    cleaned = re.sub(r'[^\w\s]', ' ', txt_sem_acento).strip()
+    return cleaned
 
-
-def remove_acento(txt):
-    txt = safe_text(txt)
-    nfkd = unicodedata.normalize("NFKD", txt)
-    return "".join([c for c in nfkd if not unicodedata.combining(c)]).lower()
-
-
-def classificar_topico(texto):
-    txt = remove_acento(texto)
-    if not txt:
-        return "N / E"
-
-    ruido = ["zzz", "xxx", "..."]
-    if any(r in txt for r in ruido):
-        return "N / E"
-    if txt == "nao":
-        return "N / E"
-
-    temas = {
-        "Professor / Conteúdo": [
-            "professor", "coordenador", "explica", "didatica", "postura", "aula", "aulas", 
-            "ensino", "paciencia", "atencioso", "materia", "material", "grade", "aprendizado", 
-            "ler", "apostila", "slides", "pdf", "leitura", "livro", "prova", "exercicio","conteudo", "assunto", "tema", "topico", "assunto", "dificil de entender", "dificil de aprender", "dificil de acompanhar", "dificil de seguir", "dificil de compreender", "dificil de assimilar", "dificil de captar", "dificil de absorver", "dificil de pegar", "dificil de entender", "dificil de aprender", "dificil de acompanhar", "dificil de seguir", "dificil de compreender", "dificil de assimilar", "dificil de captar", "dificil de absorver", "dificil de pegar","dificil de entender", "dificil de aprender", "dificil de acompanhar", "dificil de seguir", "dificil de compreender", "dificil de assimilar", "dificil de captar", "dificil de absorver", "dificil de pegar", "facil de entender", "facil de aprender", "facil de acompanhar", "facil de seguir", "facil de compreender", "facil de assimilar", "facil de captar", "facil de absorver", "facil de pegar"],
-        
-        "Elogio": [
-            "gostei", "amei", "excelente", "otimo", "perfeito", "parabens", "interessante", 
-            "motivador", "divertido", "top", "bom", "show","maravilhoso", "incrivel", "fantastico", "adorei", "muito bom", "super recomendo","parabéns","recomendo", "satisfeito", "satisfacao", "satisfaz", "satisfazendo", "satisfez", "satisfeito", "satisfeitos", "satisfeita", "satisfeitas"],
-        
-        "Erro - BUG": [
-            "travou", "acesso", "bug", "estabilidade", "app", "aplicativo", "link", 
-            "moodle", "blackboard", "lag", "conexao", "lentidao", "carregamento", "erro","falha", "instabilidade", "problema tecnico", "problema de acesso", "problema de conexao", "problema de carregamento", "problema de link", "problema de app", "problema de aplicativo", "travamento", "travou", "lag", "lentidao","problema tecnico", "problema de acesso", "problema de conexao", "problema de carregamento", "problema de link", "problema de app", "problema de aplicativo"],
-        
-        "Audio": [
-            "audio", "som", "baixo", "ruido", "chiado", "mudo", "microfone", "escutar", "ouvir","volume","alto", "claridade", "distancia", "eco", "interferencia", "falar", "voz", "fala", "dificil de ouvir", "dificil de escutar", "dificil de entender"],
-        
-        "Conteúdo diferente da Aula": [
-            "diferente", "divergente", "nao condiz", "outro assunto", "errado", "trocado","conteudo diferente", "conteudo divergente", "conteudo nao condiz", "conteudo outro assunto", "conteudo errado", "conteudo trocado","assunto diferente", "assunto divergente", "assunto nao condiz", "assunto outro assunto", "assunto errado", "assunto trocado","topico diferente", "topico divergente", "topico nao condiz", "topico outro assunto", "topico errado", "topico trocado"],
-        
-        "Qualidade do Vídeo": [
-            "video", "imagem", "resolucao", "baixa qualidade", "pixelado", "borrado", "escuro","qualidade do video", "qualidade da imagem", "resolucao baixa", "video pixelado", "video borrado", "video escuro", "imagem pixelada", "imagem borrada", "imagem escura", "resolucao baixa", "qualidade ruim", "qualidade pessima","qualidade do video", "qualidade da imagem", "resolucao baixa", "video pixelado", "video borrado", "video escuro", "imagem pixelada", "imagem borrada", "imagem escura", "resolucao baixa", "qualidade ruim", "qualidade pessima"],
-        
-        "Edição": [
-            "edicao", "corte", "montagem", "transicao", "legenda", "erro de edicao","edicao ruim", "edicao pessima", "corte ruim", "corte pessimo", "montagem ruim", "montagem pessima", "transicao ruim", "transicao pessima", "legenda ruim", "legenda pessima", "erro de edicao", "erro de edição","erro de edicao", "erro de edição"],
-        
-        "Musica: Abertura / Fechamento": [
-            "musica", "trilha", "abertura", "fechamento", "vinheta", "intro", "volume da musica","musica ruim", "musica pessima", "trilha ruim", "trilha pessima", "abertura ruim", "abertura pessima", "fechamento ruim", "fechamento pessimo", "vinheta ruim", "vinheta pessima", "intro ruim", "intro pessima", "volume da musica ruim", "volume da musica alto", "volume da musica baixo","musica ruim", "musica pessima", "trilha ruim", "trilha pessima", "abertura ruim", "abertura pessima", "fechamento ruim", "fechamento pessimo", "vinheta ruim", "vinheta pessima", "intro ruim", "intro pessima", "volume da musica ruim", "volume da musica alto", "volume da musica baixo"],
-        
-        "Tutor": [
-            "tutor", "tutoria", "monitor", "ajuda", "suporte acadêmico", "duvida", "atendimento", "resposta", "rapidez", "eficaz","tutor ruim", "tutor pessimo", "tutoria ruim", "tutoria pessima", "monitor ruim", "monitor pessimo", "ajuda ruim", "ajuda pessima", "suporte academico ruim", "suporte academico pessimo", "duvida sem resposta", "duvida nao respondida", "atendimento ruim", "atendimento pessimo", "resposta ruim", "resposta pessima", "rapidez ruim", "rapidez pessima", "eficaz ruim", "eficaz pessimo","tutor ruim", "tutor pessimo", "tutoria ruim", "tutoria pessima", "monitor ruim", "monitor pessimo", "ajuda ruim", "ajuda pessima", "suporte academico ruim", "suporte academico pessimo", "duvida sem resposta", "duvida nao respondida", "atendimento ruim", "atendimento pessimo", "resposta ruim", "resposta pessima", "rapidez ruim", "rapidez pessima", "eficaz ruim", "eficaz pessimo"],
-        }
-
-    for tema, palavras in temas.items():
-        for p in palavras:
-            if re.search(rf"\b{re.escape(p)}\b", txt):
-                return tema
-
-    if any(word in txt for word in ["gostei", "amei", "excelente", "otimo", "otima", "muito bom", "maravilhoso"]):
-        return "Engajamento"
-    if any(word in txt for word in ["ruim", "péssimo", "horrivel", "chato", "pior"]):
-        return "Engajamento"
-
-    return "N / E"
-
-
-def classificar_sentimento_hibrido(texto, nota=None):
-    txt = safe_text(texto).lower()
-
-    if any(neg in txt for neg in NEGATIVOS):
-        return "Detrator"
-    if any(pos in txt for pos in POSITIVOS):
-        return "Promotor"
-
-    if nota is not None and pd.notna(nota):
-        try:
-            valor = float(nota)
-            if valor <= 2:
-                return "Detrator"
-            if valor >= 4:
-                return "Promotor"
-            if valor == 3:
-                return "Neutro"
-        except Exception:
-            pass
-
-    if not txt.strip():
-        return "Neutro"
-
+def regra_sentimento(txt_limpo):
+    """Recebe o texto já limpo para economizar processamento"""
+    if not txt_limpo: return "Neutro"
+    if any(neg in txt_limpo for neg in NEGATIVOS): return "Detrator"
+    if any(pos in txt_limpo for pos in POSITIVOS): return "Promotor"
     return "Neutro"
 
+def regra_topico(txt_limpo):
+    """Recebe o texto já limpo para economizar processamento"""
+    if not txt_limpo: return "N / E"
+    for tema, keywords in TEMAS_DICT.items():
+        if any(re.search(rf"\b{re.escape(kw)}\b", txt_limpo) for kw in keywords):
+            return tema
+    return "N / E"
 
-def treinar_modelos(df_treino, texto_col="comentario", nota_col="avaliacao"):
-    """Treina os modelos de Sentimento e Topico com dados agregados"""
-    
+def processar_tudo_em_um(texto):
+    limpo = limpar_texto(texto)
+    sentimento = regra_sentimento(limpo)
+    topico = regra_topico(limpo)
+    return pd.Series([limpo, sentimento, topico])
+
+def classificar_sentimento_nota(nota):
+    try:
+        if pd.isna(nota): return "Neutro"
+        valor = float(nota)
+        if valor <= 2: return "Detrator"
+        if valor >= 4: return "Promotor"
+        return "Neutro"
+    except:
+        return "Neutro"
+
+# ----------------- Core de Treino e Processamento -----------------
+
+def treinar_modelos(df_treino):
     print("\n" + "="*60)
-    print("TREINO DOS MODELOS")
+    print("TREINANDO MODELOS (LOGISTIC REGRESSION)")
     print("="*60)
     
-    # Preparar dados de treino
-    X = df_treino[texto_col].fillna("")
+    X = df_treino["texto_limpo"].fillna("")
     
-    # Treinar modelo de Sentimento
-    print("\n>>> Treinando modelo de Sentimento...")
-    y_sentimento = df_treino["true_sentiment"] if "true_sentiment" in df_treino.columns else df_treino["sentimento_regra"]
+    # Modelo Sentimento - Adicionado n_jobs=-1 para usar todos os núcleos do PC
+    y_s = df_treino["sentimento_regra"]
+    model_s = make_pipeline(TfidfVectorizer(ngram_range=(1,2), max_features=10000), 
+                             LogisticRegression(class_weight='balanced', max_iter=1000, n_jobs=-1))
+    model_s.fit(X, y_s)
     
-    X_train_s, X_test_s, y_train_s, y_test_s = train_test_split(X, y_sentimento, stratify=y_sentimento, random_state=42, test_size=0.2)
-    modelo_sentimento = make_pipeline(TfidfVectorizer(max_features=15000, ngram_range=(1,2)), LogisticRegression(max_iter=1500, class_weight="balanced"))
-    modelo_sentimento.fit(X_train_s, y_train_s)
+    # Modelo Tópico
+    df_t = df_treino[df_treino["topico_regra"] != "N / E"]
+    if not df_t.empty:
+        model_t = make_pipeline(TfidfVectorizer(ngram_range=(1,2)), 
+                                 LogisticRegression(class_weight='balanced', max_iter=1000, n_jobs=-1))
+        model_t.fit(df_t["texto_limpo"], df_t["topico_regra"])
+    else:
+        model_t = None
     
-    pred_sentimento = modelo_sentimento.predict(X_test_s)
-    print("\n=== Resultado: Modelo Sentimento (test) ===")
-    print(classification_report(y_test_s, pred_sentimento, digits=4))
-    
-    # Treinar modelo de Topico
-    print("\n>>> Treinando modelo de Topico...")
-    y_topico = df_treino["topico_regra"]
-    
-    X_train_t, X_test_t, y_train_t, y_test_t = train_test_split(X, y_topico, stratify=y_topico, random_state=42, test_size=0.2)
-    modelo_topico = make_pipeline(TfidfVectorizer(max_features=15000, ngram_range=(1,2)), LogisticRegression(max_iter=1500, class_weight="balanced"))
-    modelo_topico.fit(X_train_t, y_train_t)
-    
-    pred_topico = modelo_topico.predict(X_test_t)
-    print("\n=== Resultado: Modelo Topico (test) ===")
-    print(classification_report(y_test_t, pred_topico, digits=4))
-    
-    return modelo_sentimento, modelo_topico
+    return model_s, model_t
 
-
-def processar_arquivo(caminho_arquivo, modelo_sentimento, modelo_topico, texto_col="comentario", nota_col="avaliacao"):
-    """Aplica classificações a um arquivo e retorna dataframe atualizado"""
-    
-    print(f"\n>>> Processando: {os.path.basename(caminho_arquivo)}")
-    
-    # Carregar arquivo
+def processar_arquivo(caminho_arquivo, model_s, model_t):
     df = pd.read_parquet(caminho_arquivo)
     
-    # Aplicar regras
-    df["topico_regra"] = df[texto_col].apply(classificar_topico)
-    df["sentimento_regra"] = df.apply(lambda r: classificar_sentimento_hibrido(r[texto_col], r.get(nota_col)), axis=1)
+    # Aplicando a lógica unificada (Substitui os 3 apply individuais)
+    # Isso percorre a coluna 'comentario' apenas UMA vez
+    df[["texto_limpo", "sentimento_regra", "topico_regra"]] = df["comentario"].progress_apply(processar_tudo_em_um)
     
-    # Aplicar modelos ML
-    X = df[texto_col].fillna("")
-    df["sentimento_ml"] = modelo_sentimento.predict(X)
-    df["topico_ml"] = modelo_topico.predict(X)
+    df["sentimento_nota_pura"] = df["avaliacao"].apply(classificar_sentimento_nota)
     
-    # Aplicar combos
-    df["sentimento_combo"] = df.apply(lambda r: r["sentimento_regra"] if r["sentimento_regra"] != "Neutro" else r["sentimento_ml"], axis=1)
+    # Predição ML
+    mask_util = df["texto_limpo"].apply(lambda x: len(str(x).split()) >= 1)
+    df["sentimento_ml"] = "Neutro"
+    df["topico_ml"] = "N / E"
+    
+    if any(mask_util):
+        df.loc[mask_util, "sentimento_ml"] = model_s.predict(df.loc[mask_util, "texto_limpo"])
+        if model_t:
+            df.loc[mask_util, "topico_ml"] = model_t.predict(df.loc[mask_util, "texto_limpo"])
+    
+    # Hierarquia Combo
+    def escolher_sentimento_final(row):
+        if not mask_util[row.name]: return row["sentimento_nota_pura"]
+        if row["sentimento_regra"] != "Neutro": return row["sentimento_regra"]
+        if row["sentimento_ml"] != "Neutro": return row["sentimento_ml"]
+        return row["sentimento_nota_pura"]
+
+    df["sentimento_combo"] = df.apply(escolher_sentimento_final, axis=1)
     df["topico_combo"] = df.apply(lambda r: r["topico_regra"] if r["topico_regra"] != "N / E" else r["topico_ml"], axis=1)
     
-    print(f"   ✓ {len(df)} linhas processadas")
+    # Limpeza para salvar
+    cols_drop = ["texto_limpo", "sentimento_nota_pura", "sentimento_ml", "topico_ml"]
+    df = df.drop(columns=[c for c in cols_drop if c in df.columns])
     
     return df
 
+# ----------------- Pipeline de Execução -----------------
 
-def rollback_arquivos(backup_map):
-    """Restaura todos os arquivos a partir do backup"""
-    print("\n--- Iniciando rollback dos arquivos modificados ---")
-    for original, backup in backup_map.items():
-        try:
-            shutil.copy2(backup, original)
-            print(f"   ✓ Restaurado: {os.path.basename(original)}")
-        except Exception as e:
-            print(f"   ❌ Falha ao restaurar {os.path.basename(original)}: {e}")
-    print("--- Rollback concluído ---\n")
-
-
-def run_producao():
-    """Pipeline de produção: encontra e atualiza todos os arquivos df_evento_disc_ccom"""
-    
-    print("\n" + "="*60)
-    print("PIPELINE PRODUÇÃO - CLASSIFICAÇÃO DE DISCIPLINAS")
-    print("="*60)
-    print(f"Pasta: {pasta_origem_dir}")
-    
-    # Encontrar arquivos
+def run_graduacao_integrado():
     pattern = os.path.join(pasta_origem_dir, "df_evento_disc_ccom*.parquet")
     arquivos = sorted(glob.glob(pattern))
     
     if not arquivos:
-        print("❌ Nenhum arquivo df_evento_disc_ccom*.parquet encontrado!")
+        print("❌ Nenhum arquivo Parquet encontrado.")
         return
-    
-    print(f"\n✓ Encontrados {len(arquivos)} arquivo(s):")
-    for arq in arquivos:
-        print(f"  - {os.path.basename(arq)}")
-    
-    # Etapa 1: Agregar dados para treino
-    print("\n" + "="*60)
-    print("ETAPA 1: AGREGAÇÃO PARA TREINO")
-    print("="*60)
-    
-    dfs_lista = []
-    for caminho in arquivos:
-        try:
-            df = pd.read_parquet(caminho)
-            if "comentario" not in df.columns:
-                print(f"   ⚠ Pulando {os.path.basename(caminho)}: coluna 'comentario' não encontrada")
-                continue
-            dfs_lista.append(df)
-            print(f"  ✓ Carregado: {os.path.basename(caminho)} ({len(df)} linhas)")
-        except Exception as e:
-            print(f"  ❌ Erro ao carregar {os.path.basename(caminho)}: {e}")
-    
-    if not dfs_lista:
-        print("❌ Nenhum arquivo válido para processar!")
+
+    print(f"📂 Encontrados {len(arquivos)} arquivos. Iniciando leitura e amostragem...")
+
+    try:
+        lista_dfs = []
+        for a in tqdm(arquivos, desc="Carregando arquivos para treino"):
+            # Lemos apenas as colunas necessárias para o treino para economizar RAM
+            temp_df = pd.read_parquet(a, columns=["comentario"])
+            lista_dfs.append(temp_df)
+        
+        df_full = pd.concat(lista_dfs, ignore_index=True)
+        del lista_dfs # Libera memória imediatamente
+        gc.collect()
+
+        # ESTRATÉGIA DE AMOSTRAGEM: 55M é impossível em RAM comum.
+        # 300k a 500k é o "sweet spot" para treino de texto. 
+        if len(df_full) > 500000:
+            print(f"⚖️ Aplicando amostragem: Reduzindo de {len(df_full)} para 500.000 linhas.")
+            df_full = df_full.sample(n=500000, random_state=42)
+
+        print("\n⚙️ Processando regras de treino (Unificado)...")
+        # Aplica limpeza e regras em um único passo
+        df_full[["texto_limpo", "sentimento_regra", "topico_regra"]] = df_full["comentario"].progress_apply(processar_tudo_em_um)
+        
+        model_s, model_t = treinar_modelos(df_full)
+        
+        # Limpa o df de treino para dar espaço ao processamento real
+        del df_full
+        gc.collect()
+
+    except Exception as e:
+        print(f"❌ Falha na fase de treino: {e}")
         return
-    
-    df_completo = pd.concat(dfs_lista, ignore_index=True)
-    print(f"\n✓ Dados agregados: {len(df_completo)} linhas totais")
-    
-    # Aplicar regras base para agregado
-    df_completo["topico_regra"] = df_completo["comentario"].apply(classificar_topico)
-    df_completo["sentimento_regra"] = df_completo.apply(lambda r: classificar_sentimento_hibrido(r["comentario"], r.get("avaliacao")), axis=1)
-    df_completo["true_sentiment"] = df_completo["sentimento_regra"]
-    
-    # Etapa 2: Treinar modelos
-    modelo_sentimento, modelo_topico = treinar_modelos(df_completo)
-    
-    # Etapa 3: Aplicar a todos os arquivos
-    print("\n" + "="*60)
-    print("ETAPA 3: APLICAÇÃO NOS ARQUIVOS")
-    print("="*60)
-    
+
+    # Etapa 2: Processamento Individual
     backup_map = {}
     try:
         for caminho in arquivos:
-            backup_caminho = f"{caminho}.bak"
-            shutil.copy2(caminho, backup_caminho)
-            backup_map[caminho] = backup_caminho
-
-            df_processado = processar_arquivo(caminho, modelo_sentimento, modelo_topico)
-
-            # Sobrescrever arquivo original
+            print(f"\n🚀 Processando: {os.path.basename(caminho)}")
+            
+            backup_path = caminho + ".bak"
+            shutil.copy2(caminho, backup_path)
+            backup_map[caminho] = backup_path
+            
+            df_processado = processar_arquivo(caminho, model_s, model_t)
             df_processado.to_parquet(caminho, index=False)
-            print(f"   ✓ Arquivo salvo com sucesso")
+            
+            # Limpa o DF atual da memória antes do próximo arquivo
+            del df_processado
+            gc.collect()
+
+        # Remove backups se tudo ok
+        for b in backup_map.values():
+            if os.path.exists(b): os.remove(b)
+        
+        print("\n" + "="*60)
+        print("✅ PROCESSO CONCLUÍDO COM SUCESSO!")
+        print("="*60)
 
     except Exception as e:
-        print(f"   ❌ Erro crítico durante o processamento: {e}")
-        rollback_arquivos(backup_map)
-        print("❌ Processo abortado. Arquivos originais restaurados com backup.")
-        return
-
-    # Remover backups somente se tudo deu certo
-    for backup in backup_map.values():
-        try:
-            os.remove(backup)
-        except Exception:
-            pass
-
-    # Relatório final
-    print("\n" + "="*60)
-    print("✓ PROCESSO CONCLUÍDO COM SUCESSO")
-    print("="*60)
-    print("\nColunas adicionadas aos arquivos:")
-    print("  - topico_regra, topico_ml, topico_combo")
-    print("  - sentimento_regra, sentimento_ml, sentimento_combo")
-    print("\nOs arquivos foram atualizados in-place (sem criar novos arquivos)")
-
+        print(f"❌ Erro durante o processamento: {e}")
 
 if __name__ == "__main__":
-    run_producao()
+    run_graduacao_integrado()
